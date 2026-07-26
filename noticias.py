@@ -83,23 +83,49 @@ except Exception:
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "noticias.log")
 
 
-def ahora_en_madrid():
-    """Hora peninsular sin depender de la base de datos de zonas horarias.
+def ahora_utc():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
-    Windows no la trae, asi que se aplican directamente las reglas europeas:
-    UTC+2 entre el ultimo domingo de marzo y el ultimo domingo de octubre
-    (ambos a las 01:00 UTC), y UTC+1 el resto del ano.
-    """
+
+def es_horario_de_verano(utc=None):
+    """Reglas europeas: verano entre el ultimo domingo de marzo y el de octubre,
+    ambos a las 01:00 UTC. Se calculan a mano porque Windows no trae la base de
+    datos de zonas horarias y zoneinfo falla ahi."""
     from calendar import monthrange
 
-    utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    utc = utc or ahora_utc()
 
     def ultimo_domingo(mes):
         ultimo = datetime(utc.year, mes, monthrange(utc.year, mes)[1])
         return (ultimo - timedelta(days=(ultimo.weekday() + 1) % 7)).replace(hour=1)
 
-    verano = ultimo_domingo(3) <= utc < ultimo_domingo(10)
-    return utc + timedelta(hours=2 if verano else 1)
+    return ultimo_domingo(3) <= utc < ultimo_domingo(10)
+
+
+def ahora_en_madrid(utc=None):
+    """Hora peninsular, sin depender de la base de datos de zonas horarias."""
+    utc = utc or ahora_utc()
+    return utc + timedelta(hours=2 if es_horario_de_verano(utc) else 1)
+
+
+def hora_utc_programada():
+    """Hora UTC del cron que disparo esta ejecucion, leida del evento de GitHub.
+
+    Importa usar esto y no el reloj: GitHub retrasa las tareas programadas con
+    frecuencia, y si una arrancase mas de una hora tarde, mirar la hora real
+    descartaria el envio y el fallo pasaria inadvertido (la ejecucion sale verde).
+    Devuelve None si no se ejecuta desde una programacion de GitHub.
+    """
+    ruta = os.environ.get("GITHUB_EVENT_PATH", "")
+    if not ruta or not os.path.exists(ruta):
+        return None
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            cron = json.load(f).get("schedule") or ""
+    except Exception:
+        return None
+    m = re.match(r"\s*\S+\s+(\d{1,2})\s", cron)
+    return int(m.group(1)) if m else None
 
 
 def log(msg):
@@ -129,9 +155,9 @@ def limpiar(texto):
     return re.sub(r"\s+", " ", texto).strip()
 
 
-def descargar(url):
+def descargar(url, timeout=45):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "es-ES,es;q=0.9"})
-    with urllib.request.urlopen(req, timeout=45) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         crudo = r.read()
     charset = "utf-8"
     m = re.search(rb'charset=["\']?([\w-]+)', crudo[:3000], re.I)
@@ -143,6 +169,8 @@ def descargar(url):
 def absoluta(href, base):
     if href.startswith("http"):
         return href
+    if href.startswith("//"):  # enlace sin protocolo: //dominio.com/ruta
+        return "https:" + href
     return base + href if href.startswith("/") else f"{base}/{href}"
 
 
@@ -167,7 +195,7 @@ def fecha_es(texto):
 def fecha_del_articulo(url):
     """Lee 'datePublished' del JSON-LD de la ficha, para las que no la muestran en portada."""
     try:
-        pagina = descargar(url)
+        pagina = descargar(url, timeout=20)
     except Exception:
         return None, False
     m = re.search(r'"datePublished"\s*:\s*"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})', pagina)
@@ -445,10 +473,23 @@ def main():
     # y a las 7:00 UTC y aqui se descarta la que no corresponda: una u otra son las
     # 8:00 en Madrid segun sea horario de verano o de invierno.
     if "--solo-a-las-8" in sys.argv:
-        madrid = ahora_en_madrid()
-        if madrid.hour != 8:
-            log(f"En Madrid son las {madrid:%H:%M}, no las 8:00. Esta ejecucion no envia nada.")
-            return 0
+        # Las 8:00 de Madrid son las 6:00 UTC en verano y las 7:00 en invierno.
+        esperada = 6 if es_horario_de_verano() else 7
+        programada = hora_utc_programada()
+
+        if programada is not None:
+            # Caso normal en GitHub: se mira que cron disparo la ejecucion, asi que
+            # un retraso en el arranque no altera la decision.
+            if programada != esperada:
+                log(f"Esta es la ejecucion de las {programada}:00 UTC y ahora la que "
+                    f"corresponde a las 8:00 de Madrid es la de las {esperada}:00. No envia nada.")
+                return 0
+        else:
+            # Fuera de GitHub no hay evento que consultar: se mira el reloj.
+            madrid = ahora_en_madrid()
+            if madrid.hour != 8:
+                log(f"En Madrid son las {madrid:%H:%M}, no las 8:00. Esta ejecucion no envia nada.")
+                return 0
 
     resultados = []
     for fuente in FUENTES:
@@ -462,7 +503,8 @@ def main():
         log("ERROR: ninguna fuente devolvio titulares. No se envia email.")
         return 1
 
-    ahora = datetime.now()
+    # Madrid, no el reloj de la maquina: los servidores de GitHub van en UTC.
+    ahora = ahora_en_madrid()
     fecha_corta = f"{ahora:%d/%m/%Y}"
     dias = ["Lunes", "Martes", "Miercoles", "Jueves", "Viernes", "Sabado", "Domingo"]
     fecha_texto = f"{dias[ahora.weekday()]} {fecha_corta}"
