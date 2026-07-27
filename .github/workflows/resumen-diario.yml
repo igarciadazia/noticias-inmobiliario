@@ -2,11 +2,9 @@ name: Resumen inmobiliario diario
 
 on:
   schedule:
-    # GitHub programa siempre en UTC. Se lanza a las dos horas posibles y el
-    # propio script descarta la que no sean las 8:00 en Madrid.
-    - cron: "0 6 * * *"   # 8:00 en Madrid con horario de verano
-    - cron: "0 7 * * *"   # 8:00 en Madrid con horario de invierno
-  workflow_dispatch:      # permite lanzarlo a mano desde la web
+    - cron: "35 4 * * *"
+    - cron: "35 5 * * *"
+  workflow_dispatch:
 
 jobs:
   enviar:
@@ -23,6 +21,4 @@ jobs:
       - name: Enviar el resumen
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        # En las ejecuciones programadas se comprueba la hora de Madrid.
-        # Si se lanza a mano, se envia siempre (para poder probarlo).
         run: python noticias.py ${{ github.event_name == 'schedule' && '--solo-a-las-8' || '' }}
