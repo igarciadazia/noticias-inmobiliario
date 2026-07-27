@@ -40,6 +40,12 @@ def clave_resend():
             return f.read().strip()
     return ""
 
+# Franja (hora de Madrid) en la que se considera que toca el envio de la manana.
+# Los dos crons del workflow estan separados una hora exacta -- uno sirve para el
+# horario de verano y otro para el de invierno -- y solo uno cae aqui dentro.
+# Con los crons a las 4:35 y 5:35 UTC, el que corresponda cae a las 6:35 de Madrid.
+FRANJA_ENVIO = ((6, 0), (6, 59))
+
 MAX_POR_FUENTE = 20
 # Cuantas fichas se pueden abrir para averiguar la fecha de las noticias que no
 # la muestran en portada. Limita lo que puede tardar el script.
@@ -108,8 +114,8 @@ def ahora_en_madrid(utc=None):
     return utc + timedelta(hours=2 if es_horario_de_verano(utc) else 1)
 
 
-def hora_utc_programada():
-    """Hora UTC del cron que disparo esta ejecucion, leida del evento de GitHub.
+def hora_programada_utc():
+    """(hora, minuto) UTC del cron que disparo esta ejecucion, segun el evento de GitHub.
 
     Importa usar esto y no el reloj: GitHub retrasa las tareas programadas con
     frecuencia, y si una arrancase mas de una hora tarde, mirar la hora real
@@ -124,8 +130,22 @@ def hora_utc_programada():
             cron = json.load(f).get("schedule") or ""
     except Exception:
         return None
-    m = re.match(r"\s*\S+\s+(\d{1,2})\s", cron)
-    return int(m.group(1)) if m else None
+    m = re.match(r"\s*(\d{1,2})\s+(\d{1,2})\s", cron)
+    return (int(m.group(2)), int(m.group(1))) if m else None
+
+
+def le_toca_enviar(hora_utc, minuto_utc, utc=None):
+    """Decide si el cron indicado es el que corresponde al envio de la manana.
+
+    Hay dos crons separados una hora exacta (uno para horario de verano y otro
+    para invierno). Se convierte la hora programada a hora de Madrid y solo envia
+    el que cae dentro de FRANJA_ENVIO, asi que siempre entra uno y solo uno.
+    """
+    desfase = 2 if es_horario_de_verano(utc) else 1
+    minutos_madrid = (hora_utc + desfase) * 60 + minuto_utc
+    inicio = FRANJA_ENVIO[0][0] * 60 + FRANJA_ENVIO[0][1]
+    fin = FRANJA_ENVIO[1][0] * 60 + FRANJA_ENVIO[1][1]
+    return inicio <= minutos_madrid % (24 * 60) <= fin, minutos_madrid % (24 * 60)
 
 
 def log(msg):
@@ -473,22 +493,23 @@ def main():
     # y a las 7:00 UTC y aqui se descarta la que no corresponda: una u otra son las
     # 8:00 en Madrid segun sea horario de verano o de invierno.
     if "--solo-a-las-8" in sys.argv:
-        # Las 8:00 de Madrid son las 6:00 UTC en verano y las 7:00 en invierno.
-        esperada = 6 if es_horario_de_verano() else 7
-        programada = hora_utc_programada()
+        programada = hora_programada_utc()
 
         if programada is not None:
             # Caso normal en GitHub: se mira que cron disparo la ejecucion, asi que
             # un retraso en el arranque no altera la decision.
-            if programada != esperada:
-                log(f"Esta es la ejecucion de las {programada}:00 UTC y ahora la que "
-                    f"corresponde a las 8:00 de Madrid es la de las {esperada}:00. No envia nada.")
+            toca, minutos = le_toca_enviar(*programada)
+            if not toca:
+                log(f"Esta ejecucion estaba programada para las {minutos // 60:02d}:"
+                    f"{minutos % 60:02d} de Madrid, fuera de la franja de envio. No envia nada.")
                 return 0
         else:
             # Fuera de GitHub no hay evento que consultar: se mira el reloj.
-            madrid = ahora_en_madrid()
-            if madrid.hour != 8:
-                log(f"En Madrid son las {madrid:%H:%M}, no las 8:00. Esta ejecucion no envia nada.")
+            utc = ahora_utc()
+            toca, _ = le_toca_enviar(utc.hour, utc.minute)
+            if not toca:
+                log(f"En Madrid son las {ahora_en_madrid():%H:%M}, fuera de la franja "
+                    f"de envio. No envia nada.")
                 return 0
 
     resultados = []
