@@ -1,0 +1,85 @@
+name: Alquileres La Fortuna y Los Angeles
+
+on:
+  schedule:
+    # Miercoles y sabado (3 y 6) por la manana. GitHub programa siempre en UTC,
+    # asi que se lanza a las dos horas posibles y el propio script descarta la que
+    # no corresponda a las 8:05 de Madrid. Asi el horario aguanta el cambio de
+    # estacion sin tocar nada.
+    #
+    # No se pide en punto: las horas en punto son las de mas carga en GitHub y las
+    # tareas llegan con retraso.
+    - cron: "5 6 * * 3,6"  # 8:05 en Madrid con horario de verano
+    - cron: "5 7 * * 3,6"  # 8:05 en Madrid con horario de invierno
+  workflow_dispatch:       # permite lanzarlo a mano desde la web
+
+# Necesario para poder guardar en el repositorio que anuncios se han enviado ya
+# (es lo que permite marcar los nuevos en el email siguiente).
+permissions:
+  contents: write
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar el navegador
+        # idealista esta protegido por DataDome y rechaza cualquier cliente que no
+        # sea un navegador de verdad. "chrome" instala el Google Chrome autentico,
+        # que es el que mejor pasa el filtro; chromium queda de suplente.
+        # --with-deps trae ademas las librerias del sistema y xvfb, que es lo que
+        # permite abrir el navegador "con ventana" en un servidor sin pantalla.
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chrome
+          python -m playwright install --with-deps chromium
+          # xvfb suele venir de serie en el runner, pero no esta garantizado y sin
+          # el no se puede abrir el navegador "con ventana".
+          sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Enviar el email de alquileres
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # Solo por si algun dia hiciera falta un servicio de scraping de pago.
+          # Si no existen, llegan vacias y el script ni las mira.
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPINGBEE_KEY: ${{ secrets.SCRAPINGBEE_KEY }}
+          ZENROWS_KEY: ${{ secrets.ZENROWS_KEY }}
+          SCRAPERAPI_NIVEL: ${{ secrets.SCRAPERAPI_NIVEL }}
+        # xvfb-run da una pantalla virtual: sin ella no se puede abrir el navegador
+        # en modo "con ventana", que es una de las configuraciones que prueba.
+        #
+        # En las ejecuciones programadas se comprueba la hora de Madrid.
+        # Si se lanza a mano, se envia siempre (para poder probarlo).
+        run: >
+          xvfb-run -a
+          python alquileres.py
+          ${{ github.event_name == 'schedule' && '--solo-por-la-manana' || '' }}
+
+      - name: Recordar los anuncios de este envio
+        # Si esto fallara, el email ya se ha enviado: lo unico que pasaria es que
+        # el proximo marcaria todo como nuevo. No debe tumbar la ejecucion.
+        continue-on-error: true
+        run: |
+          if [ ! -f estado_alquileres.json ]; then
+            echo "No hay estado que guardar (el envio no llego a completarse)."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add estado_alquileres.json
+          if git diff --staged --quiet; then
+            echo "Sin cambios en la lista de anuncios."
+          else
+            git commit -m "Anuncios enviados el $(date +%F)"
+            git push
+          fi
