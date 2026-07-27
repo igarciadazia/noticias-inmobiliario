@@ -50,10 +50,25 @@ ZONAS = [
     },
 ]
 
-# Franja (hora de Madrid) en la que se considera que toca el envio de la manana.
-# Los dos crons del workflow estan separados una hora exacta -- uno sirve para el
-# horario de verano y otro para el de invierno -- y solo uno cae aqui dentro.
-FRANJA_ENVIO = ((8, 0), (8, 59))
+# Dias de envio en hora de Madrid: 0 = lunes ... 6 = domingo.
+DIAS_ENVIO = (2, 5)  # miercoles y sabado
+
+# Ventana (hora de Madrid) dentro de la cual se acepta enviar.
+#
+# El workflow lanza VARIOS intentos dentro de esta ventana. El primero que consiga
+# ejecutarse manda el email y deja escrita la marca "ya enviado hoy"; los demas la
+# leen y se retiran solos. Es lo que protege del punto debil de verdad:
+#
+#   GitHub NO garantiza las tareas programadas. Las mete en una cola compartida y,
+#   si hay atasco, las DESCARTA -- no las retrasa: las pierde, sin aviso, sin email
+#   y sin dejar rastro en la pestana Actions. Con un unico disparo al dia, un
+#   descarte son 3 o 4 dias sin email y sin que nadie se entere.
+#
+# Por eso tampoco se mira que cron disparo la ejecucion, sino el reloj: da igual
+# cual de los intentos llegue, mientras caiga dentro de la ventana.
+VENTANA_ENVIO = ((7, 40), (14, 0))
+
+DIAS = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
 # Tope de anuncios por zona en el email. Hoy hay 2 y 10; sobra de largo.
 MAX_POR_ZONA = 40
@@ -116,33 +131,29 @@ def ahora_en_madrid(utc=None):
     return utc + timedelta(hours=2 if es_horario_de_verano(utc) else 1)
 
 
-def hora_programada_utc():
-    """(hora, minuto) UTC del cron que disparo esta ejecucion, segun el evento de GitHub.
+def toca_enviar(estado, ahora=None):
+    """(si_toca, motivo_por_el_que_no). Mira dia, hora de Madrid y si ya se envio.
 
-    Importa usar esto y no el reloj: GitHub retrasa las tareas programadas con
-    frecuencia, y si una arrancase mas de una hora tarde, mirar la hora real
-    descartaria el envio y el fallo pasaria inadvertido (la ejecucion sale verde).
-    Devuelve None si no se ejecuta desde una programacion de GitHub.
+    Cualquiera de los intentos del dia sirve: el primero que llegue hasta aqui
+    envia, y los siguientes se encuentran la marca puesta y no hacen nada.
     """
-    ruta = os.environ.get("GITHUB_EVENT_PATH", "")
-    if not ruta or not os.path.exists(ruta):
-        return None
-    try:
-        with open(ruta, encoding="utf-8") as f:
-            cron = json.load(f).get("schedule") or ""
-    except Exception:
-        return None
-    m = re.match(r"\s*(\d{1,2})\s+(\d{1,2})\s", cron)
-    return (int(m.group(2)), int(m.group(1))) if m else None
+    ahora = ahora or ahora_en_madrid()
 
+    if ahora.weekday() not in DIAS_ENVIO:
+        return False, f"hoy es {DIAS[ahora.weekday()].lower()} y no toca envío"
 
-def le_toca_enviar(hora_utc, minuto_utc, utc=None):
-    """Decide si el cron indicado es el que corresponde al envio de la manana."""
-    desfase = 2 if es_horario_de_verano(utc) else 1
-    minutos_madrid = (hora_utc + desfase) * 60 + minuto_utc
-    inicio = FRANJA_ENVIO[0][0] * 60 + FRANJA_ENVIO[0][1]
-    fin = FRANJA_ENVIO[1][0] * 60 + FRANJA_ENVIO[1][1]
-    return inicio <= minutos_madrid % (24 * 60) <= fin, minutos_madrid % (24 * 60)
+    minutos = ahora.hour * 60 + ahora.minute
+    inicio = VENTANA_ENVIO[0][0] * 60 + VENTANA_ENVIO[0][1]
+    fin = VENTANA_ENVIO[1][0] * 60 + VENTANA_ENVIO[1][1]
+    if not inicio <= minutos <= fin:
+        return False, (f"en Madrid son las {ahora:%H:%M}, fuera de la ventana de envío "
+                       f"({VENTANA_ENVIO[0][0]:02d}:{VENTANA_ENVIO[0][1]:02d}"
+                       f"-{VENTANA_ENVIO[1][0]:02d}:{VENTANA_ENVIO[1][1]:02d})")
+
+    if estado.get("ultimo_envio") == f"{ahora:%Y-%m-%d}":
+        return False, "el email de hoy ya salió en un intento anterior"
+
+    return True, ""
 
 
 def limpiar(texto):
@@ -460,26 +471,37 @@ def recoger(zona, pagina, error):
 
 
 def leer_estado():
-    """IDs de anuncios que ya salieron en el email anterior, por zona."""
+    """El fichero de estado entero: anuncios ya enviados y fecha del ultimo envio."""
     try:
         with open(ESTADO_PATH, encoding="utf-8") as f:
-            datos = json.load(f)
-        return {k: set(v) for k, v in datos.get("vistos", {}).items()}
+            return json.load(f)
     except Exception:
         return {}
 
 
-def guardar_estado(vistos):
+def vistos_de(estado):
+    """IDs de anuncios que ya salieron en el email anterior, por zona."""
+    return {k: set(v) for k, v in (estado.get("vistos") or {}).items()}
+
+
+def guardar_estado(vistos, ahora=None):
+    """Guarda que anuncios se han enviado y, sobre todo, que HOY ya se ha enviado.
+
+    Esa fecha es la marca que hace que los intentos posteriores del mismo dia se
+    retiren en lugar de mandar un segundo email.
+    """
+    ahora = ahora or ahora_en_madrid()
     try:
         with open(ESTADO_PATH, "w", encoding="utf-8") as f:
             json.dump({
-                "actualizado": f"{ahora_en_madrid():%Y-%m-%d %H:%M} (Madrid)",
+                "actualizado": f"{ahora:%Y-%m-%d %H:%M} (Madrid)",
+                "ultimo_envio": f"{ahora:%Y-%m-%d}",
                 "vistos": {k: sorted(v) for k, v in vistos.items()},
             }, f, indent=2)
         return True
-    except Exception as e:
-        log(f"AVISO: no se pudo guardar el estado ({type(e).__name__}). "
-            f"El proximo email marcara todo como nuevo.")
+    except Exception:
+        log("AVISO: no se pudo guardar el estado. El proximo email marcara todo como "
+            "nuevo, y si hoy queda algun intento por delante podria repetirse.")
         return False
 
 
@@ -694,25 +716,15 @@ def enviar(asunto, cuerpo_html):
 def main():
     dry_run = "--dry-run" in sys.argv
 
-    if "--solo-por-la-manana" in sys.argv:
-        programada = hora_programada_utc()
-        if programada is not None:
-            # Caso normal en GitHub: se mira que cron disparo la ejecucion, asi que
-            # un retraso en el arranque no altera la decision.
-            toca, minutos = le_toca_enviar(*programada)
-            if not toca:
-                log(f"Esta ejecucion estaba programada para las {minutos // 60:02d}:"
-                    f"{minutos % 60:02d} de Madrid, fuera de la franja de envio. No envia nada.")
-                return 0
-        else:
-            utc = ahora_utc()
-            toca, _ = le_toca_enviar(utc.hour, utc.minute)
-            if not toca:
-                log(f"En Madrid son las {ahora_en_madrid():%H:%M}, fuera de la franja "
-                    f"de envio. No envia nada.")
-                return 0
+    estado = leer_estado()
 
-    estado_previo = leer_estado()
+    if "--solo-por-la-manana" in sys.argv:
+        toca, motivo = toca_enviar(estado)
+        if not toca:
+            log(f"No envía nada: {motivo}.")
+            return 0
+
+    estado_previo = vistos_de(estado)
     primera_vez = not estado_previo
     resultados = []
     estado_nuevo = dict(estado_previo)
@@ -745,8 +757,7 @@ def main():
 
     ahora = ahora_en_madrid()
     fecha_corta = f"{ahora:%d/%m/%Y}"
-    dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    fecha_texto = f"{dias[ahora.weekday()]} {fecha_corta}"
+    fecha_texto = f"{DIAS[ahora.weekday()]} {fecha_corta}"
 
     total_nuevos = sum(len(n) for _, _, _, n in resultados)
     cuerpo = construir_html(resultados, fecha_texto)
@@ -766,7 +777,9 @@ def main():
     log(("OK · " if ok else "FALLO · ") + detalle)
 
     if ok:
-        guardar_estado(estado_nuevo)
+        # Lo primero que hay que dejar escrito es que hoy ya se ha enviado: es lo
+        # que impide que los intentos que queden por delante repitan el email.
+        guardar_estado(estado_nuevo, ahora)
     return 0 if ok else 1
 
 
