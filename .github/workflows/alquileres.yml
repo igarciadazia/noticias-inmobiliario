@@ -2,21 +2,40 @@ name: Alquileres La Fortuna y Los Angeles
 
 on:
   schedule:
-    # Miercoles y sabado (3 y 6) por la manana. GitHub programa siempre en UTC,
-    # asi que se lanza a las dos horas posibles y el propio script descarta la que
-    # no corresponda a las 8:05 de Madrid. Asi el horario aguanta el cambio de
-    # estacion sin tocar nada.
+    # ---------------------------------------------------------------------
+    # CUATRO intentos cada miercoles y sabado (el "3,6" del final), no uno.
     #
-    # No se pide en punto: las horas en punto son las de mas carga en GitHub y las
-    # tareas llegan con retraso.
-    - cron: "5 6 * * 3,6"  # 8:05 en Madrid con horario de verano
-    - cron: "5 7 * * 3,6"  # 8:05 en Madrid con horario de invierno
-  workflow_dispatch:       # permite lanzarlo a mano desde la web
+    # GitHub NO garantiza las tareas programadas: las mete en una cola comun y,
+    # cuando hay atasco, las DESCARTA. No las retrasa para luego: las pierde, sin
+    # aviso, sin email y sin dejar ni una linea en la pestana Actions.
+    #
+    # Con un solo disparo al dia eso son 3 o 4 dias sin email y en silencio. Con
+    # varios, el primero que consiga ejecutarse manda el correo y deja escrita la
+    # marca "ya enviado hoy" en estado_alquileres.json; los siguientes la leen y
+    # se retiran solos. Solo se pierde el envio si fallan los cuatro.
+    #
+    # Los minutos son "raros" a proposito: casi todo el mundo programa en punto o
+    # a y media, y esos picos son justo los que provocan los descartes.
+    #
+    # No hace falta emparejar crons para el cambio de hora: el script no mira que
+    # cron le desperto, sino el reloj de Madrid (VENTANA_ENVIO, 07:40-14:00).
+    # ---------------------------------------------------------------------
+    - cron: "48 5 * * 3,6"   # verano 7:48 · invierno 6:48 (aun pronto, se retira)
+    - cron: "48 6 * * 3,6"   # verano 8:48 · invierno 7:48
+    - cron: "17 8 * * 3,6"   # verano 10:17 · invierno 9:17
+    - cron: "36 11 * * 3,6"  # verano 13:36 · invierno 12:36
+  workflow_dispatch:         # a mano: envia siempre, sin mirar dia ni hora
 
 # Necesario para poder guardar en el repositorio que anuncios se han enviado ya
-# (es lo que permite marcar los nuevos en el email siguiente).
+# y que dia se envio por ultima vez.
 permissions:
   contents: write
+
+# Dos intentos no deben solaparse nunca: si uno va lento, el siguiente espera a
+# que termine y asi encuentra la marca de "ya enviado" bien escrita.
+concurrency:
+  group: alquileres
+  cancel-in-progress: false
 
 jobs:
   enviar:
@@ -35,8 +54,7 @@ jobs:
         # idealista esta protegido por DataDome y rechaza cualquier cliente que no
         # sea un navegador de verdad. "chrome" instala el Google Chrome autentico,
         # que es el que mejor pasa el filtro; chromium queda de suplente.
-        # --with-deps trae ademas las librerias del sistema y xvfb, que es lo que
-        # permite abrir el navegador "con ventana" en un servidor sin pantalla.
+        # --with-deps trae ademas las librerias del sistema que necesita.
         run: |
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet playwright
@@ -58,28 +76,31 @@ jobs:
         # xvfb-run da una pantalla virtual: sin ella no se puede abrir el navegador
         # en modo "con ventana", que es una de las configuraciones que prueba.
         #
-        # En las ejecuciones programadas se comprueba la hora de Madrid.
-        # Si se lanza a mano, se envia siempre (para poder probarlo).
+        # En las ejecuciones programadas se comprueban dia, hora de Madrid y si el
+        # email de hoy ya salio. Si se lanza a mano, se envia siempre.
         run: >
           xvfb-run -a
           python alquileres.py
           ${{ github.event_name == 'schedule' && '--solo-por-la-manana' || '' }}
 
-      - name: Recordar los anuncios de este envio
-        # Si esto fallara, el email ya se ha enviado: lo unico que pasaria es que
-        # el proximo marcaria todo como nuevo. No debe tumbar la ejecucion.
+      - name: Recordar que ya se ha enviado
+        # Esto es lo que impide que los intentos posteriores repitan el email, asi
+        # que importa que salga bien. Aun asi no debe tumbar la ejecucion: el email
+        # ya se ha enviado y lo peor que puede pasar es un correo repetido.
         continue-on-error: true
         run: |
           if [ ! -f estado_alquileres.json ]; then
-            echo "No hay estado que guardar (el envio no llego a completarse)."
+            echo "No hay estado que guardar (esta ejecucion no envio nada)."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add estado_alquileres.json
           if git diff --staged --quiet; then
-            echo "Sin cambios en la lista de anuncios."
+            echo "Sin cambios en el estado."
           else
-            git commit -m "Anuncios enviados el $(date +%F)"
+            git commit -m "Envio del $(date +%F)"
+            # Por si otra ejecucion hubiera escrito en medio.
+            git pull --rebase --autostash || true
             git push
           fi
