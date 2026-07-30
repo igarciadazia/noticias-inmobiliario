@@ -40,11 +40,11 @@ def clave_resend():
             return f.read().strip()
     return ""
 
-# Franja (hora de Madrid) en la que se considera que toca el envio de la manana.
-# Los dos crons del workflow estan separados una hora exacta -- uno sirve para el
-# horario de verano y otro para el de invierno -- y solo uno cae aqui dentro.
-# Con los crons a las 4:35 y 5:35 UTC, el que corresponda cae a las 6:35 de Madrid.
-FRANJA_ENVIO = ((6, 0), (6, 59))
+# Franja (hora de Madrid) dentro de la cual se acepta el envio de la manana.
+# El workflow lanza VARIOS intentos aqui dentro porque el programador de GitHub
+# es de "mejor esfuerzo" y descarta ejecuciones sin avisar. El primero que salga
+# adelante envia; los demas ven la marca del dia y se retiran solos.
+FRANJA_ENVIO = ((6, 0), (8, 59))
 
 MAX_POR_FUENTE = 20
 # Cuantas fichas se pueden abrir para averiguar la fecha de las noticias que no
@@ -132,6 +132,37 @@ def hora_programada_utc():
         return None
     m = re.match(r"\s*(\d{1,2})\s+(\d{1,2})\s", cron)
     return (int(m.group(2)), int(m.group(1))) if m else None
+
+
+MARCA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultimo-envio.txt")
+
+
+def hoy_en_madrid():
+    return f"{ahora_en_madrid():%Y-%m-%d}"
+
+
+def ya_enviado_hoy():
+    """La marca vive en el repositorio y la escribe la ejecucion que consigue enviar.
+
+    Es lo que permite programar varios intentos por la manana sin duplicar correos:
+    el primero que funciona deja la fecha escrita y los siguientes se retiran.
+    """
+    try:
+        with open(MARCA_PATH, encoding="utf-8") as f:
+            return f.read().strip() == hoy_en_madrid()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False  # ante la duda, mejor enviar que quedarse callado
+
+
+def marcar_enviado():
+    try:
+        with open(MARCA_PATH, "w", encoding="utf-8") as f:
+            f.write(hoy_en_madrid() + "\n")
+    except Exception as e:
+        log(f"AVISO: no se pudo escribir la marca del dia ({type(e).__name__}). "
+            f"Podria llegar un correo repetido.")
 
 
 def le_toca_enviar(hora_utc, minuto_utc, utc=None):
@@ -492,7 +523,7 @@ def main():
     # GitHub Actions solo programa en UTC, asi que el workflow se lanza a las 6:00
     # y a las 7:00 UTC y aqui se descarta la que no corresponda: una u otra son las
     # 8:00 en Madrid segun sea horario de verano o de invierno.
-    if "--solo-a-las-8" in sys.argv:
+    if "--programado" in sys.argv:
         programada = hora_programada_utc()
 
         if programada is not None:
@@ -500,8 +531,8 @@ def main():
             # un retraso en el arranque no altera la decision.
             toca, minutos = le_toca_enviar(*programada)
             if not toca:
-                log(f"Esta ejecucion estaba programada para las {minutos // 60:02d}:"
-                    f"{minutos % 60:02d} de Madrid, fuera de la franja de envio. No envia nada.")
+                log(f"Intento programado para las {minutos // 60:02d}:{minutos % 60:02d} "
+                    f"de Madrid, fuera de la franja de envio. No envia nada.")
                 return 0
         else:
             # Fuera de GitHub no hay evento que consultar: se mira el reloj.
@@ -511,6 +542,11 @@ def main():
                 log(f"En Madrid son las {ahora_en_madrid():%H:%M}, fuera de la franja "
                     f"de envio. No envia nada.")
                 return 0
+
+        if ya_enviado_hoy():
+            log(f"El resumen del {hoy_en_madrid()} ya se envio en un intento anterior. "
+                f"Este se retira para no duplicar.")
+            return 0
 
     resultados = []
     for fuente in FUENTES:
@@ -543,6 +579,12 @@ def main():
     log(f"Enviando a {EMAIL_TO}…")
     ok, detalle = enviar(asunto, cuerpo)
     log(("OK · " if ok else "FALLO · ") + detalle)
+
+    # Solo se marca el dia si el envio salio bien: si fallo, el siguiente intento
+    # de la manana debe volver a probarlo.
+    if ok and "--programado" in sys.argv:
+        marcar_enviado()
+
     return 0 if ok else 1
 
 
