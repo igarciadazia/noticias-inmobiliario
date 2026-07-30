@@ -3,12 +3,17 @@ name: Resumen inmobiliario diario
 on:
   schedule:
     - cron: "35 4 * * *"
+    - cron: "5 5 * * *"
     - cron: "35 5 * * *"
+    - cron: "5 6 * * *"
+    - cron: "35 6 * * *"
   workflow_dispatch:
 
 jobs:
   enviar:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Descargar el repositorio
         uses: actions/checkout@v4
@@ -21,4 +26,17 @@ jobs:
       - name: Enviar el resumen
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python noticias.py ${{ github.event_name == 'schedule' && '--solo-a-las-8' || '' }}
+        run: python noticias.py ${{ github.event_name == 'schedule' && '--programado' || '' }}
+
+      - name: Guardar la marca del dia
+        if: github.event_name == 'schedule'
+        run: |
+          if [ -n "$(git status --porcelain ultimo-envio.txt)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ultimo-envio.txt
+            git commit -m "Resumen enviado"
+            git push
+          else
+            echo "Sin cambios en la marca: este intento no envio nada."
+          fi
