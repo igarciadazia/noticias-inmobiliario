@@ -1,12 +1,16 @@
 name: Resumen inmobiliario diario
 
 on:
+  repository_dispatch:
+    types: [enviar-resumen]
+
   schedule:
     - cron: "35 4 * * *"
     - cron: "5 5 * * *"
     - cron: "35 5 * * *"
     - cron: "5 6 * * *"
     - cron: "35 6 * * *"
+
   workflow_dispatch:
 
 jobs:
@@ -26,10 +30,10 @@ jobs:
       - name: Enviar el resumen
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        run: python noticias.py ${{ github.event_name == 'schedule' && '--programado' || '' }}
+        run: python noticias.py ${{ github.event_name != 'workflow_dispatch' && '--programado' || '' }}
 
       - name: Guardar la marca del dia
-        if: github.event_name == 'schedule'
+        if: github.event_name != 'workflow_dispatch'
         run: |
           if [ -n "$(git status --porcelain ultimo-envio.txt)" ]; then
             git config user.name "github-actions[bot]"
